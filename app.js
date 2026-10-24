@@ -13,7 +13,7 @@ const ONLINE_TTL = 120e3;      // 超過此時間沒心跳視為離線
 const OUTBOX_TTL = 7 * 864e5;  // 未送達項目保留 7 天
 const SYNC_MAX = 300;          // 補歷史訊息上限
 const MAX_LEN = 4000;
-const DEFAULT_PUSH = '';       // 推播伺服器（push-worker）網址，例如 https://cladue-push.xxx.workers.dev
+const DEFAULT_PUSH = 'https://cladue-push.chtsengchrisleimeng.workers.dev';       // 推播伺服器（push-worker）網址，例如 https://cladue-push.xxx.workers.dev
 
 const te = new TextEncoder(), td = new TextDecoder();
 const subtle = crypto.subtle;
