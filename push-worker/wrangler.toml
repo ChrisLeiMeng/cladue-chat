@@ -1,0 +1,10 @@
+# 用 wrangler CLI 部署時才需要（用 Cloudflare 網頁後台部署可忽略）
+# 1. npx wrangler kv namespace create SUBS  → 把產生的 id 填到下面
+# 2. npx wrangler deploy
+name = "cladue-push"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[kv_namespaces]]
+binding = "SUBS"
+id = "填入 KV namespace id"

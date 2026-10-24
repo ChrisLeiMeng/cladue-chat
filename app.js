@@ -4,7 +4,7 @@
  */
 'use strict';
 (() => {
-const APP_VER = '1.1.1';
+const APP_VER = '1.2.0';
 const NS = 'cladue/v1';
 const DEFAULT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 const RESEND_MS = 30e3;        // 未確認的好友邀請 / 私訊 / 聊天室邀請重送間隔
@@ -13,6 +13,7 @@ const ONLINE_TTL = 120e3;      // 超過此時間沒心跳視為離線
 const OUTBOX_TTL = 7 * 864e5;  // 未送達項目保留 7 天
 const SYNC_MAX = 300;          // 補歷史訊息上限
 const MAX_LEN = 4000;
+const DEFAULT_PUSH = '';       // 推播伺服器（push-worker）網址，例如 https://cladue-push.xxx.workers.dev
 
 const te = new TextEncoder(), td = new TextDecoder();
 const subtle = crypto.subtle;
@@ -234,10 +235,73 @@ async function sendInner(code, body) {
   net.pub(inboxTopic(code), { v: 1, k: 'e', from: S.me.code, ...(await enc(await pairKey(conv), body)) });
 }
 
+/* ---------- 推播（push-worker：App 被暫停或關閉時也能收到通知） ---------- */
+const pushUrl = () => String(S.settings.pushUrl ?? DEFAULT_PUSH).trim().replace(/\/+$/, '');
+const push = {
+  ep: '',     // 自己這台裝置的訂閱 id，推播時排除自己
+  timer: 0,
+  async init() {
+    const sub = await (await navigator.serviceWorker?.ready)?.pushManager?.getSubscription();
+    if (sub) this.ep = hex(await sha256(sub.endpoint)).slice(0, 32);
+    this.schedule();
+  },
+  schedule(force = false) {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.register(force).catch(e => console.warn('push', e)), 1500);
+  },
+  // 訂閱推播，並向伺服器登記要收的頻道（自己的收件匣＋沒靜音的聊天室）
+  async register(force) {
+    const url = pushUrl();
+    if (!url || !canNotify() || !('PushManager' in window)) return;
+    const reg = await navigator.serviceWorker.ready;
+    const { key } = await (await fetch(url + '/vapid')).json();
+    let sub = await reg.pushManager.getSubscription();
+    if (sub && S.settings.vapidKey !== key) { await sub.unsubscribe(); sub = null; }
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: unb64(key.replace(/-/g, '+').replace(/_/g, '/')) });
+      S.settings.vapidKey = key;
+      force = true;
+    }
+    this.ep = hex(await sha256(sub.endpoint)).slice(0, 32);
+    const topics = [inboxTopic(S.me.code), ...[...S.convs.values()].filter(c => c.type === 'room' && !c.muted).map(c => c.topic)].sort();
+    const sig = hex(await sha256(url + '|' + sub.endpoint + '|' + topics.join(','))).slice(0, 16);
+    if (!force && sig === S.settings.pushSig && now() - (S.settings.pushAt || 0) < 7 * 864e5) return;
+    const r = await fetch(url + '/register', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ sub: sub.toJSON(), topics }) });
+    if (!r.ok) throw new Error('register ' + r.status + ' ' + (await r.text()));
+    Object.assign(S.settings, { pushSig: sig, pushAt: now() });
+    await db.put('kv', S.settings, 'settings');
+  },
+  send(topic, data) {
+    const url = pushUrl();
+    if (!url) return;
+    fetch(url + '/push', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ topic, except: this.ep, data }), keepalive: true }).catch(() => {});
+  },
+};
+// 推播內容：跟即時訊息一樣用聊天室 / 好友金鑰加密；太長放不進推播就只送「有新訊息」，打開 App 後同步
+async function pushData(key, head, body) {
+  const d = { ...head, ...(await enc(key, body)) };
+  return JSON.stringify(d).length > 3000 ? head : d;
+}
+// 推播在背景改過 IndexedDB 後，重新讀進記憶體（保留原物件，避免畫面上的參照失效）
+async function reloadState() {
+  for (const c of await db.all('convs')) {
+    const cur = S.convs.get(c.id);
+    if (cur) Object.assign(cur, c); else S.convs.set(c.id, c);
+  }
+  for (const k of await db.keys('msgs')) S.msgIds.add(k);
+  renderList();
+  if (S.active) renderMsgs();
+}
+
 /* ---------- 訊息儲存 ---------- */
 async function addMsg(conv, m, opts = {}) {
   if (S.msgIds.has(m.id)) return false;
   S.msgIds.add(m.id);
+  if (await db.get('msgs', m.id)) {  // 推播已經在背景存好了：只同步未讀數
+    Object.assign(conv, await db.get('convs', conv.id));
+    if (!opts.batch) { renderList(); if (S.active === conv.id) renderMsgs(); }
+    return false;
+  }
   m.conv = conv.id;
   await db.put('msgs', m);
   const mine = m.from === S.me.code;
@@ -278,6 +342,7 @@ async function joinRoom(roomId, pass, title) {
     conv = { id: meta.id, type: 'room', roomId, pass, topic: meta.topic, title: (title || '').trim() || roomId, created: now(), lastTs: 0, aliveTs: 0 };
     await saveConv(conv);
     net.sub(conv.topic);
+    push.schedule();
     await sysMsg(conv, '你已加入聊天室');
     await sendRoomMsg(conv, '加入了聊天室', true);
     serial(() => roomHello(conv));
@@ -295,7 +360,9 @@ async function roomHello(conv) {
 async function sendRoomMsg(conv, text, sys = false) {
   const m = { id: rid(8), from: S.me.code, name: S.me.name, ts: now(), text, sys: sys || undefined, state: 'pending' };
   await addMsg(conv, { ...m });
-  await queue({ id: m.id, kind: 'room', conv: conv.id, body: { k: 'msg', id: m.id, from: m.from, name: m.name, ts: m.ts, text, sys: m.sys } });
+  const body = { k: 'msg', id: m.id, from: m.from, name: m.name, ts: m.ts, text, sys: m.sys };
+  await queue({ id: m.id, kind: 'room', conv: conv.id, body });
+  if (!sys) push.send(conv.topic, await pushData(await roomKey(conv), { t: 'r', topic: conv.topic }, body));
 }
 async function leaveRoom(conv) {
   await sendRoomMsg(conv, '離開了聊天室', true);
@@ -310,6 +377,7 @@ async function removeConv(conv) {
   for (const it of await db.all('outbox')) if (it.conv === conv.id || (conv.code && it.to === conv.code)) await db.del('outbox', it.id);
   if (S.active === conv.id) closeConv();
   renderList();
+  push.schedule();
 }
 function touchOnline(conv, code, name) {
   if (!code || code === S.me.code) return;
@@ -378,6 +446,7 @@ async function addFriend(input) {
   conv = { id: 'f:' + code, type: 'friend', code, name: fmtCode(code), status: 'pending-out', created: now(), lastTs: now() };
   await saveConv(conv);
   await queue({ id: 'freq:' + code, kind: 'freq', to: code });
+  push.send(inboxTopic(code), { t: 'freq', from: S.me.code, name: S.me.name });
   renderList();
   openConv(conv.id);
   toast('已送出好友邀請');
@@ -388,6 +457,7 @@ async function acceptFriend(conv) {
   await saveConv(conv);
   await db.del('outbox', 'freq:' + conv.code);
   net.pub(inboxTopic(conv.code), { v: 1, k: 'facc', from: S.me.code, pub: S.me.pubJwk, name: S.me.name });
+  push.send(inboxTopic(conv.code), { t: 'facc', from: S.me.code, name: S.me.name });
   await sysMsg(conv, '你們已成為好友');
   renderList();
   openConv(conv.id);
@@ -454,14 +524,18 @@ async function onInbox(o) {
 async function sendDm(conv, text) {
   const m = { id: rid(8), from: S.me.code, name: S.me.name, ts: now(), text, state: 'pending' };
   await addMsg(conv, { ...m });
-  await queue({ id: m.id, kind: 'dm', to: conv.code, body: { k: 'dm', id: m.id, ts: m.ts, text, name: S.me.name } });
+  const body = { k: 'dm', id: m.id, ts: m.ts, text, name: S.me.name };
+  await queue({ id: m.id, kind: 'dm', to: conv.code, body });
+  push.send(inboxTopic(conv.code), await pushData(await pairKey(conv), { t: 'e', from: S.me.code }, body));
   if (net.count()) await setMsgState(m.id, 'sent');
 }
 async function inviteFriend(friendConv, room) {
   const id = rid(8);
   const m = { id, kind: 'inv', from: S.me.code, name: S.me.name, ts: now(), roomId: room.roomId, pass: room.pass, title: room.title, text: '', state: 'pending' };
   await addMsg(friendConv, m);
-  await queue({ id, kind: 'inv', to: friendConv.code, body: { k: 'inv', id, ts: m.ts, roomId: room.roomId, pass: room.pass, title: room.title, name: S.me.name } });
+  const body = { k: 'inv', id, ts: m.ts, roomId: room.roomId, pass: room.pass, title: room.title, name: S.me.name };
+  await queue({ id, kind: 'inv', to: friendConv.code, body });
+  push.send(inboxTopic(friendConv.code), await pushData(await pairKey(friendConv), { t: 'e', from: S.me.code }, body));
   if (net.count()) await setMsgState(id, 'sent');
 }
 
@@ -548,6 +622,7 @@ async function enableNotify() {
   const p = await Notification.requestPermission();
   toast(p === 'granted' ? '已開啟通知' : '未允許通知，可到瀏覽器 / 系統設定中開啟');
   renderList();
+  if (p === 'granted') push.schedule();
   return p;
 }
 // 未讀總數（不含已拒絕、已靜音的對話）
@@ -820,7 +895,7 @@ $('#main').addEventListener('click', e => {
 /* ---------- 對話框 ---------- */
 const muteRow = c => `<label class="pick" style="margin-top:12px"><input type="checkbox" id="mute" ${c.muted ? 'checked' : ''}> 🔕 關閉這個對話的通知（不計入 App 未讀數）</label>`;
 function bindMute(el, c) {
-  $('#mute', el).onchange = e => { c.muted = e.target.checked || undefined; saveConv(c); renderList(); };
+  $('#mute', el).onchange = e => { c.muted = e.target.checked || undefined; saveConv(c); renderList(); push.schedule(); };
 }
 function openNewRoom() {
   const pw = rid(4);
@@ -923,6 +998,9 @@ function openMe(first = false) {
     <button class="btn sm" id="ntf">${canNotify() ? '已開啟（App 開著時）' : '開啟訊息通知'}</button>
     <button class="btn sm" id="ntfTest">測試通知（5 秒後）</button>
     <label class="pick" style="margin-top:8px"><input type="checkbox" id="pv" ${S.settings.preview !== false ? 'checked' : ''}> 通知中顯示訊息內容</label>
+    <label>推播伺服器（App 關閉時也能收到通知，所有人需設定同一台）</label>
+    <div style="display:flex;gap:8px"><input type="text" id="pu" value="${esc(pushUrl())}" placeholder="https://cladue-push.xxx.workers.dev" autocomplete="off" style="font-size:13px"><button class="btn sm" id="savePu">套用</button></div>
+    <div class="hint" id="puSt">${!pushUrl() ? '未設定：只有 App 開著時才會通知' : !('PushManager' in window) ? (isIOS && !standalone() ? 'iPhone 請先加入主畫面再開啟' : '此瀏覽器不支援推播') : !canNotify() ? '請先開啟訊息通知' : '檢查中…'}</div>
     <div class="hint">安裝成 App（加入主畫面）後，App 圖示會顯示未讀數字。個別對話可在「⋯」裡關閉通知。<br>本程式沒有雲端主機，App 必須開著（可在背景）才能收到訊息。對方離線時，好友邀請／私訊會在雙方都上線時自動補送（最多保留 7 天）。</div>
     <label>備份 / 換手機</label>
     <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" id="exp">匯出備份</button><button class="btn sm" id="imp">匯入備份</button><input type="file" id="impF" accept=".json,application/json" class="hidden"></div>
@@ -952,7 +1030,23 @@ function openMe(first = false) {
       toast('請在 5 秒內切到背景或回到主畫面');
       setTimeout(() => showSysNotif('Cladue 測試通知', { body: '看到這則就代表通知可以正常顯示', tag: 'test', icon: 'icon-192.png', badge: 'badge-96.png' }), 5000);
     };
-    $('#pv', el).onchange =e => { S.settings.preview = e.target.checked; db.put('kv', S.settings, 'settings'); };
+    const checkPush = async (force = false) => {
+      const st = $('#puSt', el);
+      if (!pushUrl() || !canNotify() || !('PushManager' in window)) return;
+      st.textContent = '連線中…';
+      try { await push.register(force); st.textContent = '✓ 推播已啟用：App 關閉時也會收到通知'; }
+      catch (err) { st.textContent = '✗ 推播設定失敗：' + err.message; }
+    };
+    checkPush();
+    $('#savePu', el).onclick = async () => {
+      const v = $('#pu', el).value.trim();
+      if (v && !/^https:\/\//.test(v)) return toast('網址需以 https:// 開頭');
+      S.settings.pushUrl = v;
+      await db.put('kv', S.settings, 'settings');
+      if (!v) { $('#puSt', el).textContent = '未設定：只有 App 開著時才會通知'; return; }
+      checkPush(true);
+    };
+    $('#pv', el).onchange = e => { S.settings.preview = e.target.checked; db.put('kv', S.settings, 'settings'); };
     $('#exp', el).onclick = exportBackup;
     $('#imp', el).onclick = () => $('#impF', el).click();
     $('#impF', el).onchange = e => e.target.files[0] && importBackup(e.target.files[0]);
@@ -999,11 +1093,18 @@ $('#meBtn').onclick = () => openMe();
 $('#newRoomBtn').onclick = openNewRoom;
 $('#addFriendBtn').onclick = () => openAddFriend();
 window.addEventListener('hashchange', handleHash);
-document.addEventListener('visibilitychange', markActiveRead);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !S.settings) return;
+  serial(async () => { await reloadState(); markActiveRead(); });
+});
 window.addEventListener('focus', markActiveRead);
-// 點系統通知 → service worker 通知這個頁面開啟對應對話
 navigator.serviceWorker?.addEventListener('message', e => {
-  if (e.data?.type === 'open' && typeof e.data.conv === 'string') openConv(e.data.conv);
+  if (!S.settings) return;
+  // 點系統通知 → 開啟對應對話
+  if (e.data?.type === 'open' && typeof e.data.conv === 'string') serial(async () => { await reloadState(); openConv(e.data.conv); });
+  // 推播在背景存了新訊息
+  if (e.data?.type === 'sync') serial(reloadState);
+  if (e.data?.type === 'resub') push.schedule(true);
 });
 window.addEventListener('pagehide', () => {
   for (const c of S.convs.values()) if (c.type === 'room' && S.roomKeys.has(c.id))
@@ -1038,7 +1139,10 @@ async function main() {
     if (S.active) renderHeadSub();
   }), PING_MS);
 
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+    push.init().catch(e => console.warn('push', e));
+  }
 }
 main().catch(e => { console.error(e); toast('啟動失敗：' + e.message); });
 })();
