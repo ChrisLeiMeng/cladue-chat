@@ -1,5 +1,5 @@
 // 離線殼層快取：先抓網路（拿到最新版），失敗才用快取
-const CACHE = 'cladue-v1.1.0';
+const CACHE = 'cladue-v1.1.1';
 const SHELL = ['./', 'index.html', 'app.js', 'lib/mqtt.min.js', 'lib/qrcode.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'badge-96.png'];
 
 self.addEventListener('install', e => {

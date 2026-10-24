@@ -4,7 +4,7 @@
  */
 'use strict';
 (() => {
-const APP_VER = '1.1.0';
+const APP_VER = '1.1.1';
 const NS = 'cladue/v1';
 const DEFAULT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 const RESEND_MS = 30e3;        // 未確認的好友邀請 / 私訊 / 聊天室邀請重送間隔
@@ -526,11 +526,16 @@ function notify(conv, m) {
     tag: conv.id, renotify: true, timestamp: m.ts || now(),
     icon: 'icon-192.png', badge: 'badge-96.png', data: { conv: conv.id },
   };
-  if (navigator.serviceWorker?.controller) navigator.serviceWorker.ready.then(r => r.showNotification(title, opts)).catch(() => {});
-  else try {
+  showSysNotif(title, opts);
+}
+// 一律優先走 service worker（Android Chrome 不允許 new Notification()）
+async function showSysNotif(title, opts) {
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (reg) return await reg.showNotification(title, opts);
     const nt = new Notification(title, opts);
-    nt.onclick = () => { window.focus(); openConv(conv.id); nt.close(); };
-  } catch {}
+    nt.onclick = () => { window.focus(); if (opts.data?.conv) openConv(opts.data.conv); nt.close(); };
+  } catch (e) { console.warn('notify', e); }
 }
 function clearNotifs(id) {
   navigator.serviceWorker?.ready.then(r => r.getNotifications({ tag: id })).then(ns => ns.forEach(n => n.close())).catch(() => {});
@@ -916,6 +921,7 @@ function openMe(first = false) {
     <hr>
     <label>通知</label>
     <button class="btn sm" id="ntf">${canNotify() ? '已開啟（App 開著時）' : '開啟訊息通知'}</button>
+    <button class="btn sm" id="ntfTest">測試通知（5 秒後）</button>
     <label class="pick" style="margin-top:8px"><input type="checkbox" id="pv" ${S.settings.preview !== false ? 'checked' : ''}> 通知中顯示訊息內容</label>
     <div class="hint">安裝成 App（加入主畫面）後，App 圖示會顯示未讀數字。個別對話可在「⋯」裡關閉通知。<br>本程式沒有雲端主機，App 必須開著（可在背景）才能收到訊息。對方離線時，好友邀請／私訊會在雙方都上線時自動補送（最多保留 7 天）。</div>
     <label>備份 / 換手機</label>
@@ -941,7 +947,12 @@ function openMe(first = false) {
       const p = await enableNotify();
       e.target.textContent = p === 'granted' ? '已開啟（App 開著時）' : p === 'unsupported' ? '此裝置不支援' : '未允許通知';
     };
-    $('#pv', el).onchange = e => { S.settings.preview = e.target.checked; db.put('kv', S.settings, 'settings'); };
+    $('#ntfTest', el).onclick = () => {
+      if (!canNotify()) return toast('請先開啟訊息通知');
+      toast('請在 5 秒內切到背景或回到主畫面');
+      setTimeout(() => showSysNotif('Cladue 測試通知', { body: '看到這則就代表通知可以正常顯示', tag: 'test', icon: 'icon-192.png', badge: 'badge-96.png' }), 5000);
+    };
+    $('#pv', el).onchange =e => { S.settings.preview = e.target.checked; db.put('kv', S.settings, 'settings'); };
     $('#exp', el).onclick = exportBackup;
     $('#imp', el).onclick = () => $('#impF', el).click();
     $('#impF', el).onchange = e => e.target.files[0] && importBackup(e.target.files[0]);
