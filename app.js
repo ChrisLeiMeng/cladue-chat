@@ -4,7 +4,7 @@
  */
 'use strict';
 (() => {
-const APP_VER = '1.0.0';
+const APP_VER = '1.1.0';
 const NS = 'cladue/v1';
 const DEFAULT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 const RESEND_MS = 30e3;        // 未確認的好友邀請 / 私訊 / 聊天室邀請重送間隔
@@ -86,6 +86,7 @@ const S = {
   online: new Map(),         // convId -> Map(code -> {name, t})
   answered: new Set(),       // 已有人回應的 sync 請求
   seen: new Map(),           // 原始封包去重
+  unreadMark: null,          // {conv, n}：開啟對話時要畫「以下為未讀訊息」的位置
 };
 let chain = Promise.resolve();
 const serial = fn => (chain = chain.then(fn).catch(e => console.error(e)));
@@ -244,7 +245,7 @@ async function addMsg(conv, m, opts = {}) {
     conv.lastTs = m.ts;
     conv.last = m.kind === 'inv' ? `［聊天室邀請］${m.title}` : (m.sys ? `${m.name || ''} ${m.text}` : (conv.type === 'room' && !mine ? `${m.name}：` : '') + m.text);
   }
-  const viewing = S.active === conv.id && !document.hidden;
+  const viewing = S.active === conv.id && !document.hidden && document.hasFocus();
   if (!mine && !m.sys && !viewing && !opts.quiet) conv.unread = (conv.unread || 0) + 1;
   await saveConv(conv);
   if (S.active === conv.id) { if (!opts.batch) appendMsg(m); }
@@ -352,12 +353,17 @@ async function onRoom(conv, m) {
   } else if (m.k === 'hist') {
     S.answered.add(m.rq);
     if (!Array.isArray(m.msgs)) return;
-    let added = 0;
+    let added = 0, fresh = 0;
     for (const x of m.msgs) {
       if (!x || typeof x.id !== 'string' || typeof x.text !== 'string' || typeof x.from !== 'string') continue;
-      if (await addMsg(conv, { id: x.id, from: x.from, name: String(x.name || '').slice(0, 40), ts: +x.ts || 0, text: x.text.slice(0, MAX_LEN), sys: x.sys ? true : undefined, state: 'sent' }, { batch: true, quiet: x.from === S.me.code })) added++;
+      if (await addMsg(conv, { id: x.id, from: x.from, name: String(x.name || '').slice(0, 40), ts: +x.ts || 0, text: x.text.slice(0, MAX_LEN), sys: x.sys ? true : undefined, state: 'sent' }, { batch: true, quiet: x.from === S.me.code })) {
+        added++;
+        if (x.from !== S.me.code && !x.sys) fresh++;
+      }
     }
     if (added) { if (S.active === conv.id) renderMsgs(); renderList(); }
+    // 離線期間補回來的訊息：彙整成一則通知
+    if (fresh && !(S.active === conv.id && !document.hidden && document.hasFocus())) notify(conv, { text: `補收到 ${fresh} 則新訊息` });
   }
 }
 
@@ -416,7 +422,6 @@ async function onInbox(o) {
     await saveConv(conv);
     renderList();
     notify(conv, { text: '想加你為好友' });
-    toast(`${name} 想加你為好友`);
   } else if (o.k === 'facc') {
     const conv = S.convs.get('f:' + o.from);
     if (!conv || conv.status !== 'pending-out' || !(await validPeer(o))) return;
@@ -426,7 +431,7 @@ async function onInbox(o) {
     await sysMsg(conv, '對方已接受，你們已成為好友');
     renderList();
     if (S.active === conv.id) renderChat();
-    toast(`${conv.name} 已接受好友邀請`);
+    notify(conv, { text: '已接受你的好友邀請' });
     await flushOutbox();
   } else if (o.k === 'e') {
     const conv = S.convs.get('f:' + o.from);
@@ -442,8 +447,7 @@ async function onInbox(o) {
       await addMsg(conv, { id: m.id, from: conv.code, name: conv.name, ts: +m.ts || now(), text: m.text.slice(0, MAX_LEN) });
     } else if (m.k === 'inv' && typeof m.roomId === 'string' && typeof m.pass === 'string') {
       await sendInner(conv.code, { k: 'ack', id: m.id, name: S.me.name });
-      if (await addMsg(conv, { id: m.id, kind: 'inv', from: conv.code, name: conv.name, ts: +m.ts || now(), roomId: m.roomId, pass: m.pass, title: String(m.title || m.roomId).slice(0, 60), text: '' }))
-        toast(`${conv.name} 邀請你加入「${m.title || m.roomId}」`);
+      await addMsg(conv, { id: m.id, kind: 'inv', from: conv.code, name: conv.name, ts: +m.ts || now(), roomId: m.roomId, pass: m.pass, title: String(m.title || m.roomId).slice(0, 60), text: '' });
     }
   }
 }
@@ -470,6 +474,7 @@ function handleHash() {
   if (!h) return;
   history.replaceState(null, '', baseUrl());
   const p = new URLSearchParams(h);
+  if (p.get('conv')) return openConv(p.get('conv'));  // 從通知開啟
   if (p.get('add')) return openAddFriend(p.get('add'));
   if (p.get('join')) {
     let j;
@@ -499,18 +504,70 @@ function qrSvg(text) {
 }
 
 /* ---------- 通知 ---------- */
+const canNotify = () => 'Notification' in window && Notification.permission === 'granted';
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 function notify(conv, m) {
-  updateTitle();
-  if (!('Notification' in window) || Notification.permission !== 'granted' || !document.hidden) return;
-  const title = conv.type === 'room' ? `${conv.title}` : conv.name;
-  const body = (conv.type === 'room' && m.name ? m.name + '：' : '') + (m.kind === 'inv' ? '邀請你加入聊天室' : m.text);
-  const opts = { body: body.slice(0, 120), tag: conv.id, icon: 'icon-192.png' };
+  updateBadge();
+  if (conv.muted) return;
+  const title = conv.type === 'room' ? `# ${conv.title}` : conv.name;
+  const preview = S.settings.preview !== false;
+  const body = !preview ? '傳來一則新訊息'
+    : (conv.type === 'room' && m.name ? m.name + '：' : '') + (m.kind === 'inv' ? `邀請你加入聊天室「${m.title}」` : m.text);
+  // App 在前景：不跳系統通知，改用可點的提示條
+  if (!document.hidden && document.hasFocus()) {
+    if (S.active !== conv.id) toast(`${title}｜${body}`.slice(0, 80), () => openConv(conv.id));
+    return;
+  }
+  if (!canNotify()) return;
+  const n = conv.unread || 0;
+  const opts = {
+    body: (n > 1 ? `（${n} 則未讀）` : '') + body.slice(0, 120),
+    tag: conv.id, renotify: true, timestamp: m.ts || now(),
+    icon: 'icon-192.png', badge: 'badge-96.png', data: { conv: conv.id },
+  };
   if (navigator.serviceWorker?.controller) navigator.serviceWorker.ready.then(r => r.showNotification(title, opts)).catch(() => {});
-  else try { new Notification(title, opts); } catch {}
+  else try {
+    const nt = new Notification(title, opts);
+    nt.onclick = () => { window.focus(); openConv(conv.id); nt.close(); };
+  } catch {}
 }
-function updateTitle() {
-  const n = [...S.convs.values()].reduce((a, c) => a + (c.status === 'declined' ? 0 : (c.unread || 0)), 0);
-  document.title = n ? `(${n}) Cladue 聊天` : 'Cladue 聊天';
+function clearNotifs(id) {
+  navigator.serviceWorker?.ready.then(r => r.getNotifications({ tag: id })).then(ns => ns.forEach(n => n.close())).catch(() => {});
+}
+async function enableNotify() {
+  if (!('Notification' in window)) {
+    toast(isIOS && !standalone() ? 'iPhone 請先「加入主畫面」，從主畫面開啟後才能開啟通知' : '此瀏覽器不支援通知');
+    return 'unsupported';
+  }
+  const p = await Notification.requestPermission();
+  toast(p === 'granted' ? '已開啟通知' : '未允許通知，可到瀏覽器 / 系統設定中開啟');
+  renderList();
+  return p;
+}
+// 未讀總數（不含已拒絕、已靜音的對話）
+const unreadTotal = (except = null) => [...S.convs.values()]
+  .reduce((a, c) => a + (c.status === 'declined' || c.muted || c.id === except ? 0 : (c.unread || 0)), 0);
+const badgeNum = n => (n > 99 ? '99+' : n);
+function updateBadge() {
+  const n = unreadTotal();
+  document.title = n ? `(${badgeNum(n)}) Cladue 聊天` : 'Cladue 聊天';
+  // App 圖示上的數字（安裝成 App 後：Windows / macOS / Android Chrome、iOS 16.4+ 主畫面 App）
+  if ('setAppBadge' in navigator) (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+  // 手機版聊天畫面左上「‹」顯示其他對話的未讀數
+  const back = $('#backBtn');
+  if (back) { const k = unreadTotal(S.active); back.innerHTML = '‹' + (k ? `<span class="badge">${badgeNum(k)}</span>` : ''); }
+}
+function markActiveRead() {
+  const c = S.convs.get(S.active);
+  if (!c || document.hidden) return;
+  clearNotifs(c.id);
+  if (!c.unread) return;
+  S.unreadMark = { conv: c.id, n: c.unread };
+  c.unread = 0;
+  saveConv(c);
+  renderList();
+  renderMsgs();
 }
 
 /* ---------- UI ---------- */
@@ -526,14 +583,15 @@ function fmtTime(ts) {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 let toastTimer = 0;
-function toast(text) {
+function toast(text, onClick) {
   document.querySelector('.toast')?.remove();
   const t = document.createElement('div');
-  t.className = 'toast';
+  t.className = 'toast' + (onClick ? ' click' : '');
   t.textContent = text;
+  if (onClick) t.onclick = () => { t.remove(); onClick(); };
   document.body.append(t);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.remove(), 2600);
+  toastTimer = setTimeout(() => t.remove(), onClick ? 4000 : 2600);
 }
 function modal(html, onMount, { locked = false } = {}) {
   const bg = document.createElement('div');
@@ -566,10 +624,10 @@ function itemHtml(c) {
   const isRoom = c.type === 'room';
   const title = isRoom ? c.title : c.name;
   const prev = c.status === 'pending-out' ? '等待對方同意…' : (c.last || (isRoom ? `代號 ${c.roomId}` : fmtCode(c.code)));
-  return `<div class="item ${S.active === c.id ? 'active' : ''}" data-id="${esc(c.id)}">
+  return `<div class="item ${S.active === c.id ? 'active' : ''} ${c.unread ? 'unread' : ''}" data-id="${esc(c.id)}">
     ${avatar(title, c.id, isRoom ? 'room' : '')}
-    <div class="mid"><div class="t">${isRoom ? '# ' : ''}${esc(title)}</div><div class="p">${esc(prev)}</div></div>
-    <div class="r"><span>${c.lastTs ? fmtTime(c.lastTs) : ''}</span>${c.unread ? `<span class="badge">${c.unread}</span>` : ''}</div>
+    <div class="mid"><div class="t">${isRoom ? '# ' : ''}${esc(title)}${c.muted ? ' <span title="已關閉通知">🔕</span>' : ''}</div><div class="p">${esc(prev)}</div></div>
+    <div class="r"><span>${c.lastTs ? fmtTime(c.lastTs) : ''}</span>${c.unread ? `<span class="badge ${c.muted ? 'muted' : ''}">${badgeNum(c.unread)}</span>` : ''}</div>
   </div>`;
 }
 function renderList() {
@@ -578,6 +636,12 @@ function renderList() {
   const rooms = all.filter(c => c.type === 'room').sort(byTs);
   const friends = all.filter(c => c.type === 'friend' && c.status !== 'pending-in').sort(byTs);
   let h = '';
+  if (!S.settings.ntfDismissed) {
+    if ('Notification' in window && Notification.permission === 'default')
+      h += `<div class="ntf-bar">🔔<span class="mid">開啟通知，有新訊息時會像 App 一樣提醒你並顯示未讀數</span><button class="btn sm pri" data-ntf-on>開啟</button><button class="icon-btn" data-ntf-x title="不要再提示">×</button></div>`;
+    else if (isIOS && !standalone())
+      h += `<div class="ntf-bar">📲<span class="mid">iPhone 請按「分享 → 加入主畫面」，從主畫面開啟才能收到通知與圖示未讀數</span><button class="icon-btn" data-ntf-x title="不要再提示">×</button></div>`;
+  }
   if (reqs.length) {
     h += `<div class="sec">好友邀請</div>` + reqs.map(c => `<div class="req" data-req="${esc(c.id)}">
       ${avatar(c.name, c.id)}<div class="mid"><div class="t" style="font-weight:600">${esc(c.name)}</div><div class="p" style="font-size:12px;color:var(--muted)">ID ${fmtCode(c.code)}</div></div>
@@ -586,9 +650,15 @@ function renderList() {
   h += `<div class="sec">聊天室</div>` + (rooms.length ? rooms.map(itemHtml).join('') : `<div class="empty">還沒有聊天室，按「＋ 聊天室」建立或加入</div>`);
   h += `<div class="sec">好友</div>` + (friends.length ? friends.map(itemHtml).join('') : `<div class="empty">還沒有好友，按「＋ 好友」輸入對方的 ID 碼</div>`);
   $('#list').innerHTML = h;
-  updateTitle();
+  updateBadge();
 }
 $('#list').addEventListener('click', e => {
+  if (e.target.closest('[data-ntf-on]')) return enableNotify();
+  if (e.target.closest('[data-ntf-x]')) {
+    S.settings.ntfDismissed = true;
+    db.put('kv', S.settings, 'settings');
+    return renderList();
+  }
   const req = e.target.closest('[data-req]');
   if (req) {
     const c = S.convs.get(req.dataset.req);
@@ -603,14 +673,17 @@ $('#list').addEventListener('click', e => {
 function openConv(id) {
   const c = S.convs.get(id);
   if (!c) return;
+  if (S.active !== id || c.unread) S.unreadMark = { conv: id, n: c.unread || 0 };
   S.active = id;
   if (c.unread) { c.unread = 0; saveConv(c); }
+  clearNotifs(id);
   document.body.classList.add('chat-open');
   renderChat();
   renderList();
 }
 function closeConv() {
   S.active = null;
+  S.unreadMark = null;
   document.body.classList.remove('chat-open');
   $('#main').innerHTML = `<div class="welcome"><div style="font-size:48px">💬</div><h2>Cladue 聊天</h2><p>選擇左側的聊天室或好友開始聊天。</p></div>`;
   renderList();
@@ -678,11 +751,23 @@ async function renderMsgs() {
     h += `<div class="notice"><div class="big">⏳</div>已送出好友邀請給<br><b>ID ${fmtCode(c.code)}</b><br>對方開啟 App 並同意後即可開始聊天。</div>`;
   if (c.type === 'friend' && c.status === 'pending-in')
     h += `<div class="notice"><div class="big">👋</div><b>${esc(c.name)}</b> 想加你為好友<br><br><button class="btn pri" id="accBtn">接受</button> <button class="btn" id="decBtn">拒絕</button></div>`;
-  h += list.map(msgHtml).join('');
+  // 「以下為未讀訊息」分隔線：往回數 n 則別人的訊息
+  const mark = S.unreadMark?.conv === c.id ? S.unreadMark : null;
+  let cut = -1;
+  if (mark?.n) {
+    for (let i = list.length - 1, k = 0; i >= 0; i--) {
+      if (list[i].from === S.me.code || list[i].sys) continue;
+      cut = i;
+      if (++k >= mark.n) break;
+    }
+  }
+  h += list.map((m, i) => (i === cut ? `<div class="unread-line" id="unreadLine">以下為未讀訊息</div>` : '') + msgHtml(m)).join('');
   box.innerHTML = h;
   $('#accBtn')?.addEventListener('click', () => serial(() => acceptFriend(c)));
   $('#decBtn')?.addEventListener('click', () => serial(() => declineFriend(c)));
-  box.scrollTop = box.scrollHeight;
+  const line = $('#unreadLine', box);
+  if (line && !mark.shown) { mark.shown = true; box.scrollTop = line.offsetTop - box.offsetTop - 60; }
+  else box.scrollTop = box.scrollHeight;
 }
 function dayLabel(ts) {
   const d = new Date(ts);
@@ -728,6 +813,10 @@ $('#main').addEventListener('click', e => {
 });
 
 /* ---------- 對話框 ---------- */
+const muteRow = c => `<label class="pick" style="margin-top:12px"><input type="checkbox" id="mute" ${c.muted ? 'checked' : ''}> 🔕 關閉這個對話的通知（不計入 App 未讀數）</label>`;
+function bindMute(el, c) {
+  $('#mute', el).onchange = e => { c.muted = e.target.checked || undefined; saveConv(c); renderList(); };
+}
 function openNewRoom() {
   const pw = rid(4);
   modal(`<h3>建立 / 加入聊天室</h3>
@@ -791,9 +880,11 @@ function roomInfo(c) {
     <label>線上成員（${on.length + 1}）</label>
     <div>你（${esc(S.me.name)}）${on.map(x => `<br>${esc(x.name)} <span style="color:var(--muted);font-size:12px">ID ${fmtCode(x.code)}</span>`).join('')}</div>
     <label>顯示名稱</label><input type="text" id="rT" value="${esc(c.title)}">
+    ${muteRow(c)}
     <div class="hint">訊息只存在每個成員自己的裝置。新成員加入時，若有其他成員在線，會自動補最近 ${SYNC_MAX} 則訊息。</div>
     <div class="acts"><button class="btn danger" id="leave">離開聊天室</button><button class="btn" data-close>關閉</button><button class="btn pri" id="save">儲存</button></div>`,
   (el, close) => {
+    bindMute(el, c);
     $('#save', el).onclick = () => { c.title = $('#rT', el).value.trim() || c.roomId; saveConv(c); close(); renderChat(); renderList(); };
     $('#leave', el).onclick = () => { if (confirm('離開後會刪除這個聊天室在本機的所有訊息，確定？')) { close(); serial(() => leaveRoom(c)); } };
   });
@@ -802,8 +893,10 @@ function friendInfo(c) {
   modal(`<h3>${esc(c.name)}</h3>
     <div class="code-big">${fmtCode(c.code)}</div>
     <div class="hint" style="text-align:center">${c.status === 'friend' ? '好友・私訊以你們兩人的金鑰端對端加密' : c.status === 'pending-out' ? '等待對方同意好友邀請' : ''}</div>
+    ${muteRow(c)}
     <div class="acts"><button class="btn danger" id="del">${c.status === 'friend' ? '刪除好友' : '取消邀請'}</button><button class="btn" data-close>關閉</button></div>`,
   (el, close) => {
+    bindMute(el, c);
     $('#del', el).onclick = () => { if (confirm('會刪除本機與此好友的所有訊息，確定？')) { close(); serial(() => removeConv(c)); } };
   });
 }
@@ -822,8 +915,9 @@ function openMe(first = false) {
     <div class="acts" style="justify-content:center"><button class="btn" id="cpy">複製加好友連結</button><button class="btn pri" id="shr">分享…</button></div>
     <hr>
     <label>通知</label>
-    <button class="btn sm" id="ntf">${'Notification' in window && Notification.permission === 'granted' ? '已開啟（App 開著時）' : '開啟訊息通知'}</button>
-    <div class="hint">本程式沒有雲端主機，App 必須開著（可在背景）才能收到訊息。對方離線時，好友邀請／私訊會在雙方都上線時自動補送（最多保留 7 天）。</div>
+    <button class="btn sm" id="ntf">${canNotify() ? '已開啟（App 開著時）' : '開啟訊息通知'}</button>
+    <label class="pick" style="margin-top:8px"><input type="checkbox" id="pv" ${S.settings.preview !== false ? 'checked' : ''}> 通知中顯示訊息內容</label>
+    <div class="hint">安裝成 App（加入主畫面）後，App 圖示會顯示未讀數字。個別對話可在「⋯」裡關閉通知。<br>本程式沒有雲端主機，App 必須開著（可在背景）才能收到訊息。對方離線時，好友邀請／私訊會在雙方都上線時自動補送（最多保留 7 天）。</div>
     <label>備份 / 換手機</label>
     <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" id="exp">匯出備份</button><button class="btn sm" id="imp">匯入備份</button><input type="file" id="impF" accept=".json,application/json" class="hidden"></div>
     <div class="hint">備份檔包含你的 ID 金鑰與所有聊天紀錄，請妥善保管。匯入後會取代這台裝置目前的資料。</div>
@@ -844,10 +938,10 @@ function openMe(first = false) {
     $('#cpy', el).onclick = () => copy(link);
     $('#shr', el).onclick = () => share(`加我 Cladue 好友（ID ${fmtCode(S.me.code)}）`, link);
     $('#ntf', el).onclick = async e => {
-      if (!('Notification' in window)) return toast('此瀏覽器不支援通知');
-      const p = await Notification.requestPermission();
-      e.target.textContent = p === 'granted' ? '已開啟（App 開著時）' : '未允許通知';
+      const p = await enableNotify();
+      e.target.textContent = p === 'granted' ? '已開啟（App 開著時）' : p === 'unsupported' ? '此裝置不支援' : '未允許通知';
     };
+    $('#pv', el).onchange = e => { S.settings.preview = e.target.checked; db.put('kv', S.settings, 'settings'); };
     $('#exp', el).onclick = exportBackup;
     $('#imp', el).onclick = () => $('#impF', el).click();
     $('#impF', el).onchange = e => e.target.files[0] && importBackup(e.target.files[0]);
@@ -894,9 +988,11 @@ $('#meBtn').onclick = () => openMe();
 $('#newRoomBtn').onclick = openNewRoom;
 $('#addFriendBtn').onclick = () => openAddFriend();
 window.addEventListener('hashchange', handleHash);
-document.addEventListener('visibilitychange', () => {
-  const c = S.convs.get(S.active);
-  if (!document.hidden && c?.unread) { c.unread = 0; saveConv(c); renderList(); }
+document.addEventListener('visibilitychange', markActiveRead);
+window.addEventListener('focus', markActiveRead);
+// 點系統通知 → service worker 通知這個頁面開啟對應對話
+navigator.serviceWorker?.addEventListener('message', e => {
+  if (e.data?.type === 'open' && typeof e.data.conv === 'string') openConv(e.data.conv);
 });
 window.addEventListener('pagehide', () => {
   for (const c of S.convs.values()) if (c.type === 'room' && S.roomKeys.has(c.id))

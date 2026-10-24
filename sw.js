@@ -1,6 +1,6 @@
 // 離線殼層快取：先抓網路（拿到最新版），失敗才用快取
-const CACHE = 'cladue-v1.0.0';
-const SHELL = ['./', 'index.html', 'app.js', 'lib/mqtt.min.js', 'lib/qrcode.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
+const CACHE = 'cladue-v1.1.0';
+const SHELL = ['./', 'index.html', 'app.js', 'lib/mqtt.min.js', 'lib/qrcode.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'badge-96.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -18,7 +18,16 @@ self.addEventListener('fetch', e => {
     }).catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match('index.html')))
   );
 });
+// 點通知：已開著就切到該對話，沒開就開啟 App 並帶上對話 id
 self.addEventListener('notificationclick', e => {
   e.notification.close();
-  e.waitUntil(self.clients.matchAll({ type: 'window' }).then(cs => (cs[0] ? cs[0].focus() : self.clients.openWindow('./'))));
+  const conv = e.notification.data?.conv;
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    const c = cs.find(x => x.focused) || cs[0];
+    if (c) {
+      if (conv) c.postMessage({ type: 'open', conv });
+      return c.focus();
+    }
+    return self.clients.openWindow(conv ? './#conv=' + encodeURIComponent(conv) : './');
+  }));
 });
